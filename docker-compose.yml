@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    image: out-of-order-events-api:latest
+    container_name: out-of-order-events-api
+    ports:
+      - "8000:8000"
+    environment:
+      APP_PORT: "8000"
+      DATABASE_PATH: /data/events.db
+      # HMAC key for snapshot export cursors; usable default, override in production
+      SNAPSHOT_CURSOR_SECRET: ${SNAPSHOT_CURSOR_SECRET:-dev-snapshot-cursor-secret}
+    volumes:
+      - events-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  events-data:
