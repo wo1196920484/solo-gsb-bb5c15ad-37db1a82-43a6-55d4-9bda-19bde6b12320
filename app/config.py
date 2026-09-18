@@ -27,6 +27,19 @@ def lease_duration_seconds() -> int:
     return value if value > 0 else 30
 
 
+def consumer_max_attempts() -> int:
+    """Consecutive nacks after which a head event is dead-lettered.
+
+    Overridden by the env var ``CONSUMER_MAX_ATTEMPTS`` (positive integer,
+    default 3; invalid values fall back to the default).
+    """
+    try:
+        value = int(os.environ.get("CONSUMER_MAX_ATTEMPTS", "3"))
+    except ValueError:
+        return 3
+    return value if value > 0 else 3
+
+
 # Fallback HMAC key for snapshot export cursors, used only when
 # SNAPSHOT_CURSOR_SECRET is not set. Fine for local development; real
 # deployments must set the env var (docker-compose.yml ships a usable default).

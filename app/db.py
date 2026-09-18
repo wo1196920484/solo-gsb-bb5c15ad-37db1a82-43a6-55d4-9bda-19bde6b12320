@@ -144,7 +144,11 @@ def initialise() -> None:
 
             -- One row per (stream, consumer): the consumption cursor plus the
             -- at-most-one outstanding claim lease. Lease columns are either all
-            -- NULL (no lease) or all set together.
+            -- NULL (no lease) or all set together. failure_seq/failure_count
+            -- track the consecutive nacks of the batch head event at the
+            -- cursor: they are NULL when there is no recorded failure (a fresh
+            -- cursor, right after a successful ack, or after a dead-letter
+            -- skip), and otherwise failure_seq equals cursor_seq.
             CREATE TABLE IF NOT EXISTS consumers (
                 stream_id        TEXT    NOT NULL,
                 consumer_id      TEXT    NOT NULL,
@@ -153,13 +157,53 @@ def initialise() -> None:
                 lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
                 lease_from_seq   INTEGER,
                 lease_to_seq     INTEGER CHECK (lease_to_seq IS NULL OR lease_to_seq >= 0),
+                failure_seq      INTEGER CHECK (failure_seq IS NULL OR failure_seq >= 0),
+                failure_count    INTEGER CHECK (failure_count IS NULL OR failure_count >= 1),
                 PRIMARY KEY (stream_id, consumer_id),
                 FOREIGN KEY (stream_id) REFERENCES streams(stream_id),
                 CHECK ((lease_token IS NULL) = (lease_expires_at IS NULL)),
                 CHECK ((lease_token IS NULL) = (lease_from_seq IS NULL)),
                 CHECK ((lease_token IS NULL) = (lease_to_seq IS NULL)),
-                CHECK (lease_to_seq IS NULL OR lease_to_seq >= lease_from_seq)
+                CHECK (lease_to_seq IS NULL OR lease_to_seq >= lease_from_seq),
+                CHECK ((failure_seq IS NULL) = (failure_count IS NULL))
             );
+
+            -- Idempotency ledger for nack requests: lease_token is the key.
+            -- The first nack of a live lease writes its outcome here; replaying
+            -- the same token (long after the lease itself was released) returns
+            -- the stored original result and never counts again.
+            CREATE TABLE IF NOT EXISTS consumer_nacks (
+                stream_id     TEXT    NOT NULL,
+                consumer_id   TEXT    NOT NULL,
+                lease_token   TEXT    PRIMARY KEY,
+                head_sequence INTEGER NOT NULL CHECK (head_sequence >= 0),
+                attempt       INTEGER NOT NULL CHECK (attempt >= 1),
+                dead_lettered INTEGER NOT NULL CHECK (dead_lettered IN (0, 1))
+            );
+
+            -- One row per (stream, consumer, sequence) dead-lettered after
+            -- CONSUMER_MAX_ATTEMPTS consecutive nacks. Written in the same
+            -- BEGIN IMMEDIATE transaction that advances the cursor past the
+            -- event, so the event is never delivered again and the dead-letter
+            -- record always exists.
+            CREATE TABLE IF NOT EXISTS dead_letters (
+                stream_id       TEXT    NOT NULL,
+                consumer_id     TEXT    NOT NULL,
+                sequence        INTEGER NOT NULL CHECK (sequence >= 0),
+                event_id        TEXT    NOT NULL,
+                delta           INTEGER NOT NULL,
+                attempts        INTEGER NOT NULL CHECK (attempts >= 1),
+                last_reason     TEXT    NOT NULL,
+                quarantined_at  INTEGER NOT NULL CHECK (quarantined_at >= 0),
+                PRIMARY KEY (stream_id, consumer_id, sequence),
+                FOREIGN KEY (stream_id, consumer_id)
+                    REFERENCES consumers(stream_id, consumer_id),
+                FOREIGN KEY (stream_id, event_id)
+                    REFERENCES events(stream_id, event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dead_letters_stream_consumer
+                ON dead_letters (stream_id, consumer_id, sequence);
             """
         )
     finally:
