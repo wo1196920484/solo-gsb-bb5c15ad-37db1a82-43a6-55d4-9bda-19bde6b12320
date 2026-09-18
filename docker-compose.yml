@@ -8,6 +8,10 @@ services:
     environment:
       APP_PORT: "8000"
       DATABASE_PATH: /data/events.db
+      # Lifetime of a consumer claim lease in seconds
+      LEASE_DURATION_SECONDS: ${LEASE_DURATION_SECONDS:-30}
+      # Consecutive nacks after which a head event is moved to the dead-letter log
+      CONSUMER_MAX_ATTEMPTS: ${CONSUMER_MAX_ATTEMPTS:-3}
       # HMAC key for snapshot export cursors; usable default, override in production
       SNAPSHOT_CURSOR_SECRET: ${SNAPSHOT_CURSOR_SECRET:-dev-snapshot-cursor-secret}
     volumes:

@@ -160,6 +160,63 @@ def initialise() -> None:
                 CHECK ((lease_token IS NULL) = (lease_to_seq IS NULL)),
                 CHECK (lease_to_seq IS NULL OR lease_to_seq >= lease_from_seq)
             );
+
+            -- One row per (stream, consumer, head sequence) still being retried:
+            -- the number of consecutive nacks recorded against the batch's first
+            -- event. Rows are created by nack (cursor is NOT advanced), removed
+            -- when the event is finally acknowledged or dead-lettered, and never
+            -- coexist with a dead_letters row for the same key.
+            CREATE TABLE IF NOT EXISTS consumer_failures (
+                stream_id   TEXT    NOT NULL,
+                consumer_id TEXT    NOT NULL,
+                sequence    INTEGER NOT NULL CHECK (sequence >= 0),
+                attempts    INTEGER NOT NULL CHECK (attempts >= 1),
+                last_reason TEXT    NOT NULL,
+                updated_at  INTEGER NOT NULL CHECK (updated_at >= 0),
+                PRIMARY KEY (stream_id, consumer_id, sequence),
+                FOREIGN KEY (stream_id, consumer_id)
+                    REFERENCES consumers(stream_id, consumer_id)
+            );
+
+            -- One row per event dead-lettered after CONSUMER_MAX_ATTEMPTS
+            -- consecutive nacks. The row is written in the same BEGIN IMMEDIATE
+            -- transaction that moves the cursor past the event, so a later claim
+            -- can never return it again. Event coordinates/delta are copied from
+            -- the immutable applied event at dead-letter time.
+            CREATE TABLE IF NOT EXISTS dead_letters (
+                stream_id         TEXT    NOT NULL,
+                consumer_id       TEXT    NOT NULL,
+                sequence          INTEGER NOT NULL CHECK (sequence >= 0),
+                event_id          TEXT    NOT NULL,
+                delta             INTEGER NOT NULL,
+                attempts          INTEGER NOT NULL CHECK (attempts >= 1),
+                last_reason       TEXT    NOT NULL,
+                dead_lettered_at  INTEGER NOT NULL CHECK (dead_lettered_at >= 0),
+                PRIMARY KEY (stream_id, consumer_id, sequence),
+                FOREIGN KEY (stream_id, consumer_id)
+                    REFERENCES consumers(stream_id, consumer_id),
+                FOREIGN KEY (stream_id, event_id)
+                    REFERENCES events(stream_id, event_id)
+            );
+
+            -- The original outcome of each settled (nacked) lease token, so a
+            -- retried nack carrying the same token returns the original result
+            -- without counting another failure. Only the most recent settled
+            -- token per (stream, consumer) is retained: once a newer lease is
+            -- claimed, the old token is rejected as lease_token_mismatch anyway.
+            CREATE TABLE IF NOT EXISTS nack_outcomes (
+                lease_token      TEXT PRIMARY KEY,
+                stream_id        TEXT    NOT NULL,
+                consumer_id      TEXT    NOT NULL,
+                cursor_seq       INTEGER NOT NULL CHECK (cursor_seq >= 0),
+                attempts         INTEGER NOT NULL CHECK (attempts >= 1),
+                max_attempts     INTEGER NOT NULL CHECK (max_attempts >= 1),
+                dead_lettered    INTEGER NOT NULL CHECK (dead_lettered IN (0, 1)),
+                reason           TEXT    NOT NULL,
+                settled_at       INTEGER NOT NULL CHECK (settled_at >= 0),
+                FOREIGN KEY (stream_id, consumer_id)
+                    REFERENCES consumers(stream_id, consumer_id)
+            );
             """
         )
     finally:

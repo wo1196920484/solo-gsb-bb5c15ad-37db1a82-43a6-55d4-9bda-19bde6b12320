@@ -21,6 +21,17 @@
   同一 token**，持 token 确认（ack）后游标原子推进；过期/旧 token 返回 `409`，
   租约到期后同批事件可被再次领取（at-least-once）。多个实例并发领取也只会存在
   一个有效租约。
+- **消费拒绝与死信（nack / dead letter）**：`POST /streams/{stream_id}/consumers/{consumer_id}/nack`
+  携带 `lease_token` 与**非空** `reason` 拒绝一个**非空**有效批次：**不推进游标**，
+  对批次**首事件**累加一次连续失败次数并**立即释放租约**，失败次数未达环境变量
+  `CONSUMER_MAX_ATTEMPTS`（Compose 默认 `3`）时，下次 claim 仍从原游标返回该首事件；
+  达到阈值的那次 nack 在**同一个 `BEGIN IMMEDIATE` 事务**内写入死信记录并把游标
+  **恰好越过该事件一个序号**，之后的 claim 从下一序号继续。空批次不可 nack（`409
+  empty_batch_not_nackable`），旧/伪造/已过期/已 nack 后又领取新租约的 token 返回
+  `409`；同一 token 在新租约产生前重试返回**原结果**且**不重复计数**（`replayed:
+  true`）。ack 成功会清零被越过事件的连续失败次数。死信可经
+  `GET /streams/{stream_id}/consumers/{consumer_id}/dead-letters` 按 `sequence`
+  升序查询（事件内容、失败次数、最后原因、隔离时间），且按消费者相互隔离。
 - **流分叉（fork）**：把源流 `[0, through_sequence)` 的**已应用**事件整体复制为
   一个新的、可继续追加事件的目标流；`fork_id` 在同一源流下是幂等键，重试安全，
   分叉记录、目标流和复制事件在同一个 `BEGIN IMMEDIATE` 事务内提交，并发请求不会
@@ -189,7 +200,122 @@ Content-Type: application/json
 
 不同 `consumer_id` 的游标与租约彼此独立；游标和租约都持久化在 SQLite 中。
 
-### 5. 分叉流（fork）
+### 5. 消费者拒绝批次（nack）与死信
+
+```
+POST /streams/{stream_id}/consumers/{consumer_id}/nack
+Content-Type: application/json
+```
+
+请求体：
+
+| 字段          | 类型   | 约束   | 说明                                   |
+| ------------- | ------ | ------ | -------------------------------------- |
+| `lease_token` | string | 非空   | claim 返回的租约 token                 |
+| `reason`      | string | 非空白 | 本次拒绝的原因（不能是空串或纯空白）   |
+
+对**当前未过期且非空**的批次 nack 时，服务端在**同一个 `BEGIN IMMEDIATE`
+事务**内：
+
+1. **不推进游标**，对批次的**第一个事件**（`from_sequence`）累加一次连续失败
+   次数（`consumer_failures`），记录最后原因；
+2. **立即释放租约**（清空租约列）——不必等待租约到期，客户端马上可以重新 claim；
+3. 若失败次数**未达** `CONSUMER_MAX_ATTEMPTS`（默认 `3`）：游标保持不动，下次
+   claim 仍从**原游标**返回同一个首事件；
+4. 若失败次数**达到阈值**：删除该事件的失败计数，写入一条**死信记录**
+   （`dead_letters`：事件坐标与 `delta` 快照、失败次数、最后原因、隔离时间），
+   并把游标**恰好推进到 `head_sequence + 1`**——同批的其余事件未被确认，之后的
+   claim 从下一序号继续返回它们。
+
+死信判定与游标推进在同一事务提交，因此"已隔离的事件绝不会再被任何 claim 发出"
+与"失败计数恰好达到阈值"都由写锁串行保证，多实例并发 nack 也只会结算一次。
+
+```json
+{
+  "status": "ok",
+  "stream_id": "acct-1",
+  "consumer_id": "worker-a",
+  "lease_token": "dJQ8DuW6F_uuBYrN1OeG2TtsVCuLivSi",
+  "cursor": 0,
+  "attempts": 1,
+  "max_attempts": 3,
+  "dead_lettered": false,
+  "reason": "payment failed",
+  "replayed": false
+}
+```
+
+- `cursor`：本次 nack 后的游标——重试期间保持不变；第 3 次（阈值）nack 时变为
+  `head_sequence + 1`；
+- `attempts`：批次首事件当前的**连续** nack 次数；`max_attempts` 为本次采用的阈值；
+- `dead_lettered`：本次 nack 是否把首事件送入死信；
+- `replayed`：同一已结算 token 的幂等重试返回 `true`，其余字段为**首次结算时的
+  原结果**（原 `cursor`/`attempts`/`reason`/`dead_lettered`），**不重复计数**。
+
+连续失败次数的语义：
+
+- 只统计批次**首事件**——每次重新 claim 都从原游标开始，卡住的首事件会反复成为
+  批次首事件；批次中的后续事件在首事件被 ack 或死信越过之前不会被计数；
+- **ack 成功**会把游标越过的事件的失败计数全部清除（故障恢复后重新计数）；
+- 首事件被死信越过后其计数行一并删除，计数只存在于仍在重试的事件上。
+
+错误与边界：
+
+- `409 Conflict`：
+  - `lease_not_active`：当前没有有效租约（尚未 claim，或已 ack/nack），且 token
+    不是最近一次已结算的 nack token；
+  - `lease_token_mismatch`：token 与当前租约不符（伪造 token、旧租约 token、
+    **已 nack 后又 claim 到新租约**再拿旧 token 重试）；
+  - `lease_expired`：token 匹配的租约已过期（不计数、不释放，需重新 claim）；
+  - `empty_batch_not_nackable`：空批次（`from_sequence == to_sequence`）没有可
+    拒绝的事件；租约保持有效，仍可正常 ack；
+- 同一 token 在**新租约产生之前**重试：返回首次结算的原结果（`replayed: true`，
+  HTTP `200`），不重复计数、不产生第二条死信；
+- `422 Unprocessable Entity`：缺少 `lease_token`/`reason`，或 `reason` 为空白；
+- `404 Not Found`：流不存在（`stream_not_found`）。
+
+不同 `consumer_id` 的失败计数与死信相互独立：一个消费者把某事件死信，不影响其他
+消费者继续 claim/ack 同一事件。
+
+### 6. 查询死信记录（dead letters）
+
+```
+GET /streams/{stream_id}/consumers/{consumer_id}/dead-letters
+```
+
+返回该消费者已隔离的全部死信，**按 `sequence` 升序**：
+
+```json
+{
+  "stream_id": "acct-1",
+  "consumer_id": "worker-a",
+  "dead_letters": [
+    {
+      "stream_id": "acct-1",
+      "consumer_id": "worker-a",
+      "sequence": 0,
+      "event_id": "e0",
+      "delta": 100,
+      "attempts": 3,
+      "last_reason": "payment failed",
+      "dead_lettered_at": 1789676192280
+    }
+  ]
+}
+```
+
+| 字段               | 说明                                                       |
+| ------------------ | ---------------------------------------------------------- |
+| `sequence`         | 被隔离事件的序号（游标越过它之后从下一序号继续）           |
+| `event_id` / `delta` | 死信时从不可变的已应用事件复制的事件内容                 |
+| `attempts`         | 隔离时累计的连续 nack 次数（即 `CONSUMER_MAX_ATTEMPTS`）   |
+| `last_reason`      | 最后一次（达到阈值那次）nack 提交的非空原因                |
+| `dead_lettered_at` | 隔离时间，POSIX 毫秒                                       |
+
+- 流不存在返回 `404 stream_not_found`；消费者从未 claim 过时返回 `dead_letters: []`；
+- 死信是**只追加**记录：游标不会回退，每个 `(stream, consumer, sequence)` 至多一条。
+
+### 7. 分叉流（fork）
 
 ```
 POST /streams/{stream_id}/forks
@@ -234,7 +360,7 @@ Content-Type: application/json
 相同 `fork_id` 请求只有一个创建分叉，其余全部拿到既有结果；并发的不同请求若争抢
 同一目标流，只有一个成功，其余得到 `409`，数据库中不会残留半成品目标流。
 
-### 6. 跨事件流原子转账（transfer）
+### 8. 跨事件流原子转账（transfer）
 
 ```
 POST /transfers
@@ -299,7 +425,7 @@ fork 等既有接口正常观察和处理。
 }
 ```
 
-### 7. 撤销已应用事件（reversal）
+### 9. 撤销已应用事件（reversal）
 
 ```
 POST /streams/{stream_id}/events/{event_id}/reversals
@@ -355,7 +481,7 @@ Content-Type: application/json
 }
 ```
 
-### 8. 不可逆封存流（seal）
+### 10. 不可逆封存流（seal）
 
 ```
 POST /streams/{stream_id}/seal
@@ -422,7 +548,7 @@ Content-Type: application/json
 }
 ```
 
-### 9. 事件历史快照导出（snapshot export）
+### 11. 事件历史快照导出（snapshot export）
 
 ```
 GET /streams/{stream_id}/events?limit=...&cursor=...
@@ -560,6 +686,72 @@ curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-a/claim \
 
 # 租约到期后再用旧 token 确认：409 lease_expired；
 # 重新 claim 可再次拿到同批事件（新 token）。
+```
+
+## 消费拒绝与死信示例（nack / dead letters）
+
+```bash
+# 准备 3 个已应用事件：e0(0,+10) e1(1,+20) e2(2,+30)
+for i in 0 1 2; do
+  curl -s -o /dev/null -X POST localhost:8000/streams/acct-dl/events \
+    -H 'Content-Type: application/json' \
+    -d "{\"event_id\":\"e$i\",\"sequence\":$i,\"delta\":$(( (i+1)*10 ))}"
+done
+
+# 第 1 次 nack：游标不动，租约立即释放，attempts=1
+TOKEN=$(curl -s -X POST localhost:8000/streams/acct-dl/consumers/worker/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":10}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["lease_token"])')
+curl -s -X POST localhost:8000/streams/acct-dl/consumers/worker/nack \
+  -H 'Content-Type: application/json' \
+  -d "{\"lease_token\":\"$TOKEN\",\"reason\":\"attempt 1 failed\"}"
+# {"status":"ok",...,"cursor":0,"attempts":1,"max_attempts":3,
+#  "dead_lettered":false,"reason":"attempt 1 failed","replayed":false}
+
+# 同一 token 立即重试：返回原结果，replayed=true，不重复计数
+curl -s -X POST localhost:8000/streams/acct-dl/consumers/worker/nack \
+  -H 'Content-Type: application/json' \
+  -d "{\"lease_token\":\"$TOKEN\",\"reason\":\"ignored retry\"}"
+# -> "replayed":true, "attempts":1, "reason":"attempt 1 failed"
+
+# 下次 claim 仍从原游标返回首事件 e0（新 token）；再 nack 两次达到阈值
+for n in 2 3; do
+  T=$(curl -s -X POST localhost:8000/streams/acct-dl/consumers/worker/claim \
+    -H 'Content-Type: application/json' -d '{"max_events":10}' \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["lease_token"])')
+  curl -s -X POST localhost:8000/streams/acct-dl/consumers/worker/nack \
+    -H 'Content-Type: application/json' \
+    -d "{\"lease_token\":\"$T\",\"reason\":\"attempt $n failed\"}"
+done
+# 第 3 次："attempts":3,"dead_lettered":true,"cursor":1 —— 死信写入且游标越过 e0
+
+# 后续 claim 从序号 1 继续（e0 永不返回）
+curl -s -X POST localhost:8000/streams/acct-dl/consumers/worker/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":10}'
+# -> events=[e1, e2]，from_sequence=1
+
+# 查询死信：按 sequence 升序，含事件内容、失败次数、最后原因、隔离时间
+curl -s localhost:8000/streams/acct-dl/consumers/worker/dead-letters
+# {"stream_id":"acct-dl","consumer_id":"worker","dead_letters":[
+#   {"stream_id":"acct-dl","consumer_id":"worker","sequence":0,"event_id":"e0",
+#    "delta":10,"attempts":3,"last_reason":"attempt 3 failed",
+#    "dead_lettered_at":1789676192280}]}
+
+# 空批次不可 nack：409 empty_batch_not_nackable（租约仍可 ack）
+curl -s -X POST localhost:8000/streams/acct-empty/consumers/worker/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":5}'   # 无已应用事件
+curl -s -i -X POST localhost:8000/streams/acct-empty/consumers/worker/nack \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token":"<空批次 token>","reason":"nothing"}'
+# HTTP/1.1 409 -> {"detail":{"code":"empty_batch_not_nackable", ...}}
+
+# 伪造/旧 token：409 lease_token_mismatch；过期 token：409 lease_expired
+curl -s -i -X POST localhost:8000/streams/acct-dl/consumers/worker/nack \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token":"bogus","reason":"x"}'
+# HTTP/1.1 409 -> {"detail":{"code":"lease_token_mismatch", ...}}
+
+# 阈值可由环境变量调整：CONSUMER_MAX_ATTEMPTS=1 时首次 nack 即隔离
 ```
 
 ## 流分叉示例（fork）
@@ -872,6 +1064,17 @@ seals(stream_id PK, seal_id, next_sequence, event_count, sha256,
 consumers(stream_id, consumer_id, cursor_seq,
           lease_token, lease_expires_at, lease_from_seq, lease_to_seq,
           PK(stream_id, consumer_id))
+consumer_failures(stream_id, consumer_id, sequence, attempts, last_reason, updated_at,
+                  PK(stream_id, consumer_id, sequence),
+                  FK(stream_id, consumer_id) -> consumers(stream_id, consumer_id))
+dead_letters(stream_id, consumer_id, sequence, event_id, delta,
+             attempts, last_reason, dead_lettered_at,
+             PK(stream_id, consumer_id, sequence),
+             FK(stream_id, consumer_id) -> consumers(stream_id, consumer_id),
+             FK(stream_id, event_id) -> events(stream_id, event_id))
+nack_outcomes(lease_token PK, stream_id, consumer_id, cursor_seq, attempts,
+              max_attempts, dead_lettered, reason, settled_at,
+              FK(stream_id, consumer_id) -> consumers(stream_id, consumer_id))
 ```
 
 - `UNIQUE(stream_id, event_id)` 保证重放幂等；
@@ -889,6 +1092,16 @@ consumers(stream_id, consumer_id, cursor_seq,
   的序号），租约四列要么整体为 NULL（无有效租约），要么整体非空。一行只持有一个
   租约，因此领取与确认都在 `BEGIN IMMEDIATE` 事务内串行执行——即使多个应用实例
   同时领取，数据库中也只会存在一个有效租约。
+- `consumer_failures` 为仍在重试的批次首事件记录**连续 nack 次数**：nack 时
+  upsert（`attempts = attempts + 1`），ack 越过该序号或事件被死信隔离时删除；
+  它与 `dead_letters` 对同一 `(stream, consumer, sequence)` 永不共存。
+- `dead_letters` 是死信（隔离）记录：达到 `CONSUMER_MAX_ATTEMPTS` 的那次 nack 在
+  推进游标的同一事务内插入，复制当时不可变事件的 `event_id`/`delta`，并保存失败
+  次数、最后原因与 POSIX 毫秒隔离时间；每个 `(stream, consumer, sequence)` 至多
+  一条、只追加，查询按 `sequence` 升序。
+- `nack_outcomes` 以 `lease_token` 为主键保存每个已结算 nack 的原结果，供同 token
+  重试幂等回放（不重复计数）；每个消费者只保留最近一次已结算 token 的结果——一旦
+  claim 到更新的租约，旧 token 一律按 `lease_token_mismatch` 拒绝。
 - `seals` 以 `stream_id` 为主键记录每流至多一条的不可逆封存：`seal_id` 为流内
   幂等键，`next_sequence` 为封存时的版本（连续前缀长度），`event_count`/`sha256`
   为按 sequence 升序的规范 JSON 行（`ensure_ascii=False`、紧凑分隔符、UTF-8、
@@ -912,6 +1125,32 @@ consumers(stream_id, consumer_id, cursor_seq,
    租约列，原子提交；
 4. 租约到期不会自动删除：旧 token 无法 ack（`409`），下一次 claim 会发放新
    token，同一批事件可被重新消费。
+
+nack 与死信的处理同样在单个 `BEGIN IMMEDIATE` 事务内完成：
+
+1. 先确认流存在（否则 `404`，事务内无写入）；读取消费者行：
+   - 当前**没有**租约时，先按 `lease_token` 查 `nack_outcomes`：命中则回放该
+     token 首次结算时的原结果（`200`、`replayed=true`、不计数）；未命中即
+     `409 lease_not_active`；
+   - 当前**有**租约时（先于回放判断）：token 不一致即
+     `409 lease_token_mismatch`（覆盖伪造 token、旧租约 token、已 nack 后又
+     claim 到新租约的 token），已过期即 `409 lease_expired`（不计数、不释放）；
+2. 空批次（`lease_from_seq >= lease_to_seq`）返回
+   `409 empty_batch_not_nackable`，租约原样保留，仍可 ack；
+3. 对批次首事件（`lease_from_seq`）在 `consumer_failures` 上 upsert：
+   `attempts = attempts + 1`、更新 `last_reason`/`updated_at`；
+4. **立即清空租约列**释放租约（无需等待到期）；
+5. 若 `attempts < CONSUMER_MAX_ATTEMPTS`：游标保持 `cursor_seq` 不动，写入
+   nack 结果后提交——下次 claim 仍从原游标返回同一首事件；
+6. 若 `attempts >= CONSUMER_MAX_ATTEMPTS`：删除该首事件的失败计数行，读取事件的
+   `event_id`/`delta`，向 `dead_letters` 插入死信记录，并把 `cursor_seq` 更新为
+   `head_sequence + 1`（只越过首事件一个序号），全部与结果行在同一事务提交；
+7. 写入结果前删除该消费者更早的 `nack_outcomes` 行（每个消费者只留最近一次）。
+
+ack 成功时除推进游标、清空租约外，还会删除 `sequence < 新游标` 的
+`consumer_failures` 行——一次成功确认即重置被越过事件的连续失败计数。并发 nack
+在写锁上串行：同一 token 的并发请求只有一个完成首次结算，其余读到 `nack_outcomes`
+后回放原结果，因此失败只计一次、死信只写一条。
 
 提交事件的处理在单个 `BEGIN IMMEDIATE` 事务内完成：
 
@@ -1029,6 +1268,7 @@ consumers(stream_id, consumer_id, cursor_seq,
 | `APP_PORT`              | `8000`                | 服务监听端口                  |
 | `DATABASE_PATH`         | `/data/events.db`     | SQLite 文件路径               |
 | `LEASE_DURATION_SECONDS` | `30`                 | claim 租约有效时长（秒，> 0） |
+| `CONSUMER_MAX_ATTEMPTS`  | `3`                  | 批次首事件连续 nack 达到此次数后被送入死信、游标越过该事件（正整数；非整数或 `< 1` 时回退默认值）。Compose 通过 `${CONSUMER_MAX_ATTEMPTS:-3}` 提供默认值，可用环境或 `.env` 覆盖，如 `CONSUMER_MAX_ATTEMPTS=5 docker compose up --build` |
 | `SNAPSHOT_CURSOR_SECRET` | `dev-snapshot-cursor-secret` | 快照导出游标的 HMAC-SHA256 签名密钥；Compose 通过 `${SNAPSHOT_CURSOR_SECRET:-dev-snapshot-cursor-secret}` 提供可用默认值，生产环境务必覆盖为随机长密钥。轮换密钥会使既有游标全部失效（`400`） |
 
 ## 运行测试
@@ -1042,7 +1282,15 @@ pytest -q
 404、422 参数校验、大批量追赶以及 20 线程并发；消费者游标部分覆盖：领取连续批次、
 缺号时只返回已应用事件、租约内重复领取同批同 token、ack 推进游标、错误/旧/过期
 token 的三种 409、租约到期后同批重新领取、多消费者独立游标、空批次以及 20 线程
-并发只产生一个有效租约；流分叉部分覆盖：整段/部分/空前缀复制、暂存事件不复制、
+并发只产生一个有效租约；消费拒绝（nack）部分覆盖：阈值内 nack 不推进游标且重领
+返回首事件、达到 `CONSUMER_MAX_ATTEMPTS` 时同一事务写死信并恰好越过一个序号、
+后续 claim 从下一序号继续、同一 token 重试返回原结果且不重复计数（含阈值时刻）、
+伪造 token `lease_token_mismatch` 且租约不受影响、未 claim `lease_not_active`、
+已 nack 后重新 claim 再用旧 token `409`、过期 token `lease_expired` 且不计数、
+空批次 `empty_batch_not_nackable` 且租约仍可 ack、`lease_token`/`reason` 缺失或
+空白 `422`、流不存在 `404`、ack 重置连续失败次数、死信不阻塞后续事件、多个毒消息
+按序隔离且按 `sequence` 升序返回、死信按消费者隔离、死信查询未知流 `404`/未知
+消费者返回空列表，以及 20 线程并发 nack 同一 token 只结算一次；流分叉部分覆盖：整段/部分/空前缀复制、暂存事件不复制、
 目标流可继续追加、源流 404、目标已存在 409、上界越界 422、相同参数重试 200 幂等、
 参数漂移 409、请求体 422，以及 20 线程并发（同一 `fork_id` 只产生一个分叉；
 不同 `fork_id` 争抢同一目标流时不留半成品）；跨流转账部分覆盖：正常扣款/入账与
@@ -1080,6 +1328,7 @@ python3 verify_transfers.py
 python3 verify_reversals.py
 python3 verify_seals.py
 python3 verify_snapshots.py
+python3 verify_nacks.py
 ```
 
 ## 项目结构
@@ -1095,7 +1344,7 @@ python3 verify_snapshots.py
 │   ├── reversals.py   # 事件撤销（reversal）幂等事务
 │   ├── seals.py       # 不可逆封存（seal）与规范 SHA-256 摘要
 │   ├── snapshots.py   # 事件历史快照导出与 HMAC 签名游标
-│   ├── consumers.py   # 消费游标与 claim/ack 租约
+│   ├── consumers.py   # 消费游标：claim/ack 租约、nack 重试与死信
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
 ├── tests/test_api.py
@@ -1105,6 +1354,7 @@ python3 verify_snapshots.py
 ├── verify_reversals.py
 ├── verify_seals.py
 ├── verify_snapshots.py
+├── verify_nacks.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

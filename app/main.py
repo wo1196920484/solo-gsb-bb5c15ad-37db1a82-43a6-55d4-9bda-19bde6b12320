@@ -104,6 +104,66 @@ class AckOut(BaseModel):
     cursor: int = Field(..., description="New cursor sequence (next event this consumer will receive)")
 
 
+class NackIn(BaseModel):
+    lease_token: str = Field(..., min_length=1)
+    reason: str = Field(
+        ..., min_length=1, description="Non-empty human-readable rejection reason"
+    )
+
+    @field_validator("lease_token", "reason")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"lease_token": "<token from claim>", "reason": "payment failed"}]
+        }
+    }
+
+
+class NackOut(BaseModel):
+    status: str
+    stream_id: str
+    consumer_id: str
+    lease_token: str = Field(..., description="The lease token this nack settled (or replays)")
+    cursor: int = Field(
+        ...,
+        description="Cursor after the nack: unchanged while the event is still retried, "
+        "advanced one step past the event when it was dead-lettered",
+    )
+    attempts: int = Field(
+        ..., description="Consecutive nack failures recorded for the batch's first event"
+    )
+    max_attempts: int = Field(..., description="Configured CONSUMER_MAX_ATTEMPTS threshold")
+    dead_lettered: bool = Field(
+        ..., description="True when this nack reached the threshold and dead-lettered the event"
+    )
+    reason: str = Field(..., description="The non-empty rejection reason")
+    replayed: bool = Field(
+        ..., description="True for an idempotent replay of an already-settled nack token"
+    )
+
+
+class DeadLetterOut(BaseModel):
+    stream_id: str
+    consumer_id: str
+    sequence: int
+    event_id: str
+    delta: int
+    attempts: int = Field(..., description="Consecutive nack failures that isolated the event")
+    last_reason: str
+    dead_lettered_at: int = Field(..., description="POSIX milliseconds isolation time")
+
+
+class DeadLetterListOut(BaseModel):
+    stream_id: str
+    consumer_id: str
+    dead_letters: list[DeadLetterOut]
+
+
 class ForkIn(BaseModel):
     fork_id: str = Field(..., min_length=1, description="Client-assigned idempotency key, unique per source stream")
     target_stream_id: str = Field(..., min_length=1, description="Stream created by the fork; must not already exist")
@@ -575,4 +635,49 @@ def ack_batch(stream_id: str, consumer_id: str, body: AckIn) -> AckOut:
         stream_id=stream_id,
         consumer_id=consumer_id,
         cursor=cursor,
+    )
+
+
+@app.post(
+    "/streams/{stream_id}/consumers/{consumer_id}/nack",
+    response_model=NackOut,
+    status_code=200,
+    tags=["consumers"],
+    summary="Reject a claimed batch: retry its first event or dead-letter it at the threshold",
+)
+def nack_batch(stream_id: str, consumer_id: str, body: NackIn) -> NackOut:
+    try:
+        result = consumers.nack(
+            stream_id, consumer_id, body.lease_token, body.reason
+        )
+    except consumers.LeaseError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+    return NackOut(**result.as_dict())
+
+
+@app.get(
+    "/streams/{stream_id}/consumers/{consumer_id}/dead-letters",
+    response_model=DeadLetterListOut,
+    tags=["consumers"],
+    summary="List a consumer's dead-letter records ordered by sequence ascending",
+)
+def list_dead_letters(stream_id: str, consumer_id: str) -> DeadLetterListOut:
+    records = consumers.list_dead_letters(stream_id, consumer_id)
+    if records is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+    return DeadLetterListOut(
+        stream_id=stream_id,
+        consumer_id=consumer_id,
+        dead_letters=[DeadLetterOut(**r.as_dict()) for r in records],
     )

@@ -373,6 +373,328 @@ def test_ack_of_empty_batch_advances_nothing(client):
 
 
 # --------------------------------------------------------------------------- #
+# Consumer nack: retries, dead-lettering and the dead-letter log
+# --------------------------------------------------------------------------- #
+
+
+def _nack(client, stream_id, consumer_id, token, reason="processing failed"):
+    return client.post(
+        f"/streams/{stream_id}/consumers/{consumer_id}/nack",
+        json={"lease_token": token, "reason": reason},
+    )
+
+
+def _dead_letters(client, stream_id, consumer_id):
+    return client.get(
+        f"/streams/{stream_id}/consumers/{consumer_id}/dead-letters"
+    )
+
+
+def test_nack_below_threshold_keeps_cursor_and_reclaims_head(client):
+    _seed_applied_events(client, "n-basic", 3)
+    batch = _claim(client, "n-basic", "worker", 2).json()
+
+    r = _nack(client, "n-basic", "worker", batch["lease_token"], "bad-luck")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["attempts"] == 1
+    assert body["max_attempts"] == 3
+    assert body["dead_lettered"] is False
+    assert body["replayed"] is False
+    assert body["cursor"] == 0
+    assert body["reason"] == "bad-luck"
+
+    # Lease was released immediately; the next claim starts at the same cursor.
+    again = _claim(client, "n-basic", "worker", 2).json()
+    assert again["lease_token"] != batch["lease_token"]
+    assert [e["sequence"] for e in again["events"]] == [0, 1]
+
+    # Nothing has been dead-lettered yet.
+    d = _dead_letters(client, "n-basic", "worker")
+    assert d.status_code == 200
+    assert d.json()["dead_letters"] == []
+
+
+def test_nack_threshold_dead_letters_head_and_advances_cursor_one_step(client):
+    _seed_applied_events(client, "n-dlq", 4)
+    token = None
+    for attempt in range(1, 4):
+        batch = _claim(client, "n-dlq", "worker", 2).json()
+        assert [e["sequence"] for e in batch["events"]] == [0, 1]
+        token = batch["lease_token"]
+        r = _nack(client, "n-dlq", "worker", token, f"why-{attempt}")
+        assert r.json()["attempts"] == attempt
+
+    last = r.json()
+    assert last["attempts"] == 3
+    assert last["dead_lettered"] is True
+    # Cursor moved one sequence past the dead head event only.
+    assert last["cursor"] == 1
+
+    # The next claim continues from sequence 1.
+    nxt = _claim(client, "n-dlq", "worker", 10).json()
+    assert [e["sequence"] for e in nxt["events"]] == [1, 2, 3]
+
+    d = _dead_letters(client, "n-dlq", "worker").json()["dead_letters"]
+    assert len(d) == 1
+    row = d[0]
+    assert row["sequence"] == 0
+    assert row["event_id"] == "n-dlq-e0"
+    assert row["delta"] == 1
+    assert row["attempts"] == 3
+    assert row["last_reason"] == "why-3"
+    assert row["dead_lettered_at"] > 0
+
+
+def test_nack_retry_with_same_token_replays_without_double_counting(client):
+    _seed_applied_events(client, "n-rep", 2)
+    batch = _claim(client, "n-rep", "worker", 2).json()
+
+    first = _nack(client, "n-rep", "worker", batch["lease_token"], "r1")
+    # Retry with the same token (and even a different reason body): the stored
+    # original result is returned and the failure is not counted twice.
+    retry = _nack(client, "n-rep", "worker", batch["lease_token"], "r2")
+    assert retry.status_code == 200
+    a, b = first.json(), retry.json()
+    assert b["replayed"] is True
+    assert b["attempts"] == 1
+    assert b["reason"] == "r1"
+    assert b["dead_lettered"] == a["dead_lettered"]
+    assert b["cursor"] == a["cursor"]
+    assert b["lease_token"] == a["lease_token"]
+
+    # Replay also works at the threshold: exactly one dead-letter row is born.
+    batch = _claim(client, "n-rep", "worker", 2).json()
+    _nack(client, "n-rep", "worker", batch["lease_token"], "r2")
+    batch = _claim(client, "n-rep", "worker", 2).json()
+    third = _nack(client, "n-rep", "worker", batch["lease_token"], "r3")
+    assert third.json()["dead_lettered"] is True
+    retried = _nack(client, "n-rep", "worker", batch["lease_token"], "r4")
+    assert retried.json()["replayed"] is True
+    assert retried.json()["attempts"] == 3
+    d = _dead_letters(client, "n-rep", "worker").json()["dead_letters"]
+    assert [x["sequence"] for x in d] == [0]
+    assert d[0]["attempts"] == 3
+    assert d[0]["last_reason"] == "r3"
+
+
+def test_nack_forged_token_returns_409_and_lease_stays_live(client):
+    _seed_applied_events(client, "n-forge", 2)
+    batch = _claim(client, "n-forge", "worker", 2).json()
+    r = _nack(client, "n-forge", "worker", "totally-fake")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "lease_token_mismatch"
+
+    # The genuine lease is untouched and still ackable.
+    assert _ack(client, "n-forge", "worker", batch["lease_token"]).status_code == 200
+
+
+def test_nack_without_claim_returns_409(client):
+    _seed_applied_events(client, "n-nolease", 1)
+    r = _nack(client, "n-nolease", "fresh-worker", "whatever")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "lease_not_active"
+
+
+def test_nack_old_settled_token_after_reclaim_returns_409(client):
+    _seed_applied_events(client, "n-old", 3)
+    first = _claim(client, "n-old", "worker", 2).json()
+    _nack(client, "n-old", "worker", first["lease_token"], "first")
+
+    second = _claim(client, "n-old", "worker", 2).json()
+    assert second["lease_token"] != first["lease_token"]
+    # The already-nacked token is stale relative to the current lease.
+    r = _nack(client, "n-old", "worker", first["lease_token"], "again")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "lease_token_mismatch"
+
+
+def test_nack_expired_lease_returns_409_and_does_not_count(client):
+    _seed_applied_events(client, "n-exp", 2)
+    batch = _claim(client, "n-exp", "worker", 2).json()
+
+    from app import consumers
+    import time
+
+    consumers._now_ms = lambda: batch["expires_at"] + 1
+    r = _nack(client, "n-exp", "worker", batch["lease_token"], "late")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "lease_expired"
+
+    consumers._now_ms = lambda: int(time.time() * 1000)
+    again = _claim(client, "n-exp", "worker", 2).json()
+    r = _nack(client, "n-exp", "worker", again["lease_token"], "fresh")
+    assert r.json()["attempts"] == 1
+    assert _dead_letters(client, "n-exp", "worker").json()["dead_letters"] == []
+
+
+def test_nack_empty_batch_returns_409_and_lease_survives(client):
+    _post(client, "n-empty", "n-empty-e1", 1, 1)  # buffered behind gap at 0
+    batch = _claim(client, "n-empty", "worker", 5).json()
+    assert batch["events"] == []
+
+    r = _nack(client, "n-empty", "worker", batch["lease_token"], "nothing here")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "empty_batch_not_nackable"
+
+    # Lease is still live: re-claim returns the same token, and ack works.
+    same = _claim(client, "n-empty", "worker", 5).json()
+    assert same["lease_token"] == batch["lease_token"]
+    assert _ack(client, "n-empty", "worker", batch["lease_token"]).status_code == 200
+
+
+def test_nack_validation_rejects_blank_fields(client):
+    _seed_applied_events(client, "n-val", 1)
+    batch = _claim(client, "n-val", "worker", 2).json()
+    assert client.post(
+        f"/streams/n-val/consumers/worker/nack",
+        json={"lease_token": batch["lease_token"], "reason": ""},
+    ).status_code == 422
+    assert client.post(
+        f"/streams/n-val/consumers/worker/nack",
+        json={"lease_token": batch["lease_token"], "reason": "   "},
+    ).status_code == 422
+    assert client.post(
+        f"/streams/n-val/consumers/worker/nack",
+        json={"lease_token": "  ", "reason": "x"},
+    ).status_code == 422
+    assert client.post(
+        f"/streams/n-val/consumers/worker/nack",
+        json={"lease_token": batch["lease_token"]},
+    ).status_code == 422
+    assert client.post(
+        f"/streams/n-val/consumers/worker/nack",
+        json={"reason": "x"},
+    ).status_code == 422
+    # The lease was never settled by the rejected requests.
+    assert _ack(client, "n-val", "worker", batch["lease_token"]).status_code == 200
+
+
+def test_nack_on_unknown_stream_returns_404(client):
+    r = _nack(client, "no-such-stream", "worker", "token")
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+
+
+def test_dead_letters_unknown_stream_returns_404_unknown_consumer_empty(client):
+    r = _dead_letters(client, "no-such-stream", "worker")
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+
+    _seed_applied_events(client, "n-dl-empty", 1)
+    r = _dead_letters(client, "n-dl-empty", "never-claimed")
+    assert r.status_code == 200
+    assert r.json() == {
+        "stream_id": "n-dl-empty",
+        "consumer_id": "never-claimed",
+        "dead_letters": [],
+    }
+
+
+def test_ack_resets_consecutive_nack_streak(client):
+    _seed_applied_events(client, "n-reset", 2)
+    batch = _claim(client, "n-reset", "worker", 2).json()
+    assert _nack(client, "n-reset", "worker", batch["lease_token"]).json()["attempts"] == 1
+
+    # Re-claim and acknowledge: the head event's failure streak is cleared.
+    batch = _claim(client, "n-reset", "worker", 2).json()
+    assert _ack(client, "n-reset", "worker", batch["lease_token"]).json()["cursor"] == 2
+
+    # A later failure on the next batch starts counting from 1 again.
+    _post(client, "n-reset", "n-reset-e2", 2, 3)
+    batch = _claim(client, "n-reset", "worker", 2).json()
+    assert [e["sequence"] for e in batch["events"]] == [2]
+    assert _nack(client, "n-reset", "worker", batch["lease_token"]).json()["attempts"] == 1
+
+
+def test_dead_lettering_one_head_does_not_block_later_events(client):
+    _seed_applied_events(client, "n-move", 4)
+    # Dead-letter sequence 0.
+    for _ in range(3):
+        batch = _claim(client, "n-move", "worker", 2).json()
+        _nack(client, "n-move", "worker", batch["lease_token"], "poison")
+    assert _dead_letters(client, "n-move", "worker").json()["dead_letters"][0]["sequence"] == 0
+
+    # Remaining events flow through and ack cleanly.
+    batch = _claim(client, "n-move", "worker", 10).json()
+    assert [e["sequence"] for e in batch["events"]] == [1, 2, 3]
+    assert _ack(client, "n-move", "worker", batch["lease_token"]).json()["cursor"] == 4
+
+    assert [
+        x["sequence"]
+        for x in _dead_letters(client, "n-move", "worker").json()["dead_letters"]
+    ] == [0]
+
+
+def test_consecutive_nacks_dead_letter_multiple_heads_in_sequence_order(client):
+    _seed_applied_events(client, "n-multi", 3)
+    for head in range(3):
+        for _ in range(3):
+            batch = _claim(client, "n-multi", "worker", 1).json()
+            assert [e["sequence"] for e in batch["events"]] == [head]
+            _nack(client, "n-multi", "worker", batch["lease_token"], f"head-{head}")
+
+    # Caught up by skipping all three; no more events to claim.
+    done = _claim(client, "n-multi", "worker", 10).json()
+    assert done["events"] == []
+    d = _dead_letters(client, "n-multi", "worker").json()["dead_letters"]
+    assert [x["sequence"] for x in d] == [0, 1, 2]
+    assert all(x["attempts"] == 3 for x in d)
+
+
+def test_dead_letters_are_isolated_per_consumer(client):
+    _seed_applied_events(client, "n-iso", 1)
+    # worker-a poisons the event; worker-b is unaffected and can ack it.
+    for _ in range(3):
+        batch = _claim(client, "n-iso", "worker-a", 5).json()
+        _nack(client, "n-iso", "worker-a", batch["lease_token"], "a-says-no")
+    batch = _claim(client, "n-iso", "worker-b", 5).json()
+    assert [e["sequence"] for e in batch["events"]] == [0]
+    assert _ack(client, "n-iso", "worker-b", batch["lease_token"]).status_code == 200
+
+    da = _dead_letters(client, "n-iso", "worker-a").json()["dead_letters"]
+    db_ = _dead_letters(client, "n-iso", "worker-b").json()["dead_letters"]
+    assert [x["sequence"] for x in da] == [0]
+    assert db_ == []
+
+
+def test_settled_token_cannot_be_replayed_through_another_consumer(client):
+    _seed_applied_events(client, "n-cross", 1)
+    batch = _claim(client, "n-cross", "worker-a", 5).json()
+    _nack(client, "n-cross", "worker-a", batch["lease_token"], "from-a")
+    # The same token presented by a different (lease-less) consumer is not a replay.
+    r = _nack(client, "n-cross", "worker-b", batch["lease_token"], "impostor")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "lease_not_active"
+    assert _dead_letters(client, "n-cross", "worker-a").json()["dead_letters"] == []
+
+
+def test_concurrent_nacks_of_same_token_settle_once(client):
+    import threading
+
+    _seed_applied_events(client, "n-conc", 2)
+    batch = _claim(client, "n-conc", "worker", 2).json()
+    results: list[int] = []
+
+    def do_nack():
+        r = _nack(client, "n-conc", "worker", batch["lease_token"], "concurrent")
+        results.append(r.status_code)
+
+    threads = [threading.Thread(target=do_nack) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == [200] * 20
+    # Exactly one failure counted; no dead letter and no duplicate outcome rows.
+    again = _claim(client, "n-conc", "worker", 2).json()
+    r = _nack(client, "n-conc", "worker", again["lease_token"], "second")
+    assert r.json()["attempts"] == 2
+    assert _dead_letters(client, "n-conc", "worker").json()["dead_letters"] == []
+
+
+# --------------------------------------------------------------------------- #
 # Stream forking
 # --------------------------------------------------------------------------- #
 
